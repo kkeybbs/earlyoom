@@ -18,6 +18,9 @@ step in earlier: [reddit r/linux][5], [superuser.com][2], [unix.stackexchange.co
 As it turns out, no, it can't. At least using the in-kernel oom-killer.
 In the user space, however, we can do whatever we want.
 
+earlyoom wants to be simple and solid. It is written in pure C with no dependencies.
+An extensive test suite (unit- and integration tests) is written in Go.
+
 What does it do
 ---------------
 earlyoom checks the amount of available memory and free swap up to 10
@@ -137,15 +140,13 @@ is, how much memory is available and how much swap is free.
 
 ```
 ./earlyoom
-earlyoom v1.4-6-ga4021ae
-mem total: 9823 MiB, swap total: 9823 MiB
-sending SIGTERM when mem <= 10 % and swap <= 10 %,
-        SIGKILL when mem <=  5 % and swap <=  5 %
-Could not lock memory - continuing anyway: Cannot allocate memory
-mem avail:  5091 of  9823 MiB (51 %), swap free: 9823 of 9823 MiB (100 %)
-mem avail:  5084 of  9823 MiB (51 %), swap free: 9823 of 9823 MiB (100 %)
-mem avail:  5086 of  9823 MiB (51 %), swap free: 9823 of 9823 MiB (100 %)
-
+eearlyoom v1.8
+mem total: 23890 MiB, user mem total: 21701 MiB, swap total: 8191 MiB
+sending SIGTERM when mem avail <= 10.00% and swap free <= 10.00%,
+        SIGKILL when mem avail <=  5.00% and swap free <=  5.00%
+mem avail: 20012 of 21701 MiB (92.22%), swap free: 5251 of 8191 MiB (64.11%)
+mem avail: 20031 of 21721 MiB (92.22%), swap free: 5251 of 8191 MiB (64.11%)
+mem avail: 20033 of 21723 MiB (92.22%), swap free: 5251 of 8191 MiB (64.11%)
 [...]
 ```
 
@@ -176,7 +177,7 @@ sudo journalctl -u earlyoom | grep sending
 Example output for above test command (`tail /dev/zero`) will look like: 
 
 ```
-Feb 20 10:59:34 debian earlyoom[10231]: sending SIGTERM to process 7378 uid 1000 "tail": badness 156, VmRSS 4962 MiB
+Feb 20 10:59:34 debian earlyoom[10231]: sending SIGTERM to process 7378 uid 1000 "tail": oom_score 156, VmRSS 4962 MiB
 ```
 
 > For older versions of `earlyoom`, use: 
@@ -204,15 +205,7 @@ succession, ensure you have some sort of rate-limit implemented.
 
 The command-line flag `--prefer` specifies processes to prefer killing;
 likewise, `--avoid` specifies
-processes to avoid killing. Processes is specified by a POSIX regular expression.
-For instance, to avoid having `foo` and `bar` be killed:
-
-```bash
-earlyoom --avoid '^(foo|bar)$'
-```
-
-The regex is matched against the basename of the process as shown
-in `/proc/PID/comm`.
+processes to avoid killing. See https://github.com/rfjakob/earlyoom/blob/master/MANPAGE.md#--prefer-regex for details.
 
 Configuration file
 ------------------
@@ -233,7 +226,7 @@ Please note that this configuration file has no effect on earlyoom instances out
 Command line options
 --------------------
 ```
-earlyoom v1.6.2-34-g75a8852-dirty
+earlyoom v1.8
 Usage: ./earlyoom [OPTION]...
 
   -m PERCENT[,KILL_PERCENT] set available memory minimum to PERCENT of total
@@ -249,17 +242,21 @@ Usage: ./earlyoom [OPTION]...
   -n                        enable d-bus notifications
   -N /PATH/TO/SCRIPT        call script after oom kill
   -g                        kill all processes within a process group
-  -d                        enable debugging messages
+  -d, --debug               enable debugging messages
   -v                        print version information and exit
   -r INTERVAL               memory report interval in seconds (default 1), set
                             to 0 to disable completely
   -p                        set niceness of earlyoom to -20 and oom_score_adj to
                             -100
+  --ignore-root-user        do not kill processes owned by root
+  --sort-by-rss             find process with the largest rss (default oom_score)
   --prefer REGEX            prefer to kill processes matching REGEX
   --avoid REGEX             avoid killing processes matching REGEX
   --ignore REGEX            ignore processes matching REGEX
   --dryrun                  dry run (do not kill any processes)
+  --syslog                  use syslog instead of std streams
   -h, --help                this help text
+
 ```
 
 See the [man page](MANPAGE.md) for details.
@@ -271,14 +268,36 @@ accept
 
 * Use case reports and feedback
 
+Implementation Notes
+--------------------
+
+* We don't use [procps/libproc2](https://man7.org/linux/man-pages/man3/procps_pids.3.html) because
+  procps_pids_select(), for some reason, always parses /proc/$pid/status.
+  This is relatively expensive, and we don't need it.
+
 Changelog
 ---------
 
-* vNEXT, in progress
-  * Introduce UserMemTotal and calculate MemAvailablePercent based on it
-    ([commit](https://github.com/rfjakob/earlyoom/commit/459d76296d3d0a0b59ee1e2e48ad2271429de916))
+* v1.8.2, 2024-05-07
+  * Fixes in `earlyoom.service` systemd unit file
+    * Add `process_mrelease` to allowed syscalls ([commit](https://github.com/rfjakob/earlyoom/commit/c171b72ba217e923551bdde7e7f00ec5a0488b54))
+    * Fix `IPAddressDeny` syntax ([commit](e6c7978813413f3ee4181b8c8b11ae088d6e92a4))
+    * Allow `-p` ([commit](b41ebb2275e59781a8d55a764863417e1e0da5f1))
+
+* v1.8.1, 2024-04-17
+  * Fix trivial test failures caused by message rewording
+    ([commit](https://github.com/rfjakob/earlyoom/commit/bfde82c001c6e5ec11dfd6e5d13dcee9a9f01229))
+
+* v1.8, 2024-04-15
+  * Introduce `user mem total` / `meminfo_t.UserMemTotal` and calculate MemAvailablePercent based on it
+    ([commit](https://github.com/rfjakob/earlyoom/commit/459d76296d3d0a0b59ee1e2e48ad2271429de916),
+    [more info in man page](https://github.com/rfjakob/earlyoom/blob/master/MANPAGE.md#-m-percentkill_percent))
   * Use `process_mrelease` ([#266](https://github.com/rfjakob/earlyoom/issues/266))
   * Support `NO_COLOR` (https://no-color.org/)
+  * Don't get confused by processes with a zombie main thread ([commit](https://github.com/rfjakob/earlyoom/commit/e54650f0baf7cef7fb1fed3b02cb8e689c6544ea))
+  * Add `--sort-by-rss`, thanks @RanHuang! This will select a process to kill acc. to the largest RSS
+    instead of largest oom_score.
+  * The Gitlab CI testsuite now also runs on Amazon Linux 2 and Oracle Linux 7.
 
 * v1.7, 2022-03-05
   * Add `-N` flag to run a script every time a process is killed ([commit](https://github.com/rfjakob/earlyoom/commit/afe03606f077a1a17e6fbc238400b3ce7a9ef2be),

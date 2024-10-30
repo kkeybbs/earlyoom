@@ -19,10 +19,10 @@
 #include "meminfo.h"
 #include "msg.h"
 
-// Processes matching "--prefer REGEX" get BADNESS_PREFER added to their badness
-#define BADNESS_PREFER 300
-// Processes matching "--avoid REGEX" get BADNESS_AVOID added to their badness
-#define BADNESS_AVOID -300
+// Processes matching "--prefer REGEX" get OOM_SCORE_PREFER added to their oom_score
+#define OOM_SCORE_PREFER 300
+// Processes matching "--avoid REGEX" get OOM_SCORE_AVOID added to their oom_score
+#define OOM_SCORE_AVOID -300
 
 // Processes matching "--prefer REGEX" get VMRSS_PREFER added to their VmRSSkiB
 #define VMRSS_PREFER 3145728
@@ -136,33 +136,36 @@ static void notify_process_killed(const poll_loop_args_t* args, const procinfo_t
 }
 
 #if defined(__NR_pidfd_open) && defined(__NR_process_mrelease)
-void mrelease(const pid_t pid)
-{
-    int pidfd = (int)syscall(__NR_pidfd_open, pid, 0);
-    if (pidfd < 0) {
-        // can happen if process has already exited
-        debug("mrelease: pid %d: error opening pidfd: %s\n", pid, strerror(errno));
-        return;
-    }
-    int res = (int)syscall(__NR_process_mrelease, pidfd, 0);
-    if (res != 0) {
-        warn("mrelease: pid=%d pidfd=%d failed: %s\n", pid, pidfd, strerror(errno));
-    } else {
-        debug("mrelease: pid=%d pidfd=%d success\n", pid, pidfd);
-    }
-}
+#define HAVE_MRELEASE
 #else
-void mrelease(__attribute__((unused)) const pid_t pid)
+#warning process_mrelease is not supported. earlyoom will still work but with degraded performance.
+#endif
+
+// kill_release kills a process and calls process_mrelease to
+// release the memory as quickly as possible.
+//
+// See https://lwn.net/Articles/864184/ for details on process_mrelease.
+int kill_release(const pid_t pid, const int pidfd, const int sig)
 {
-    debug("mrelease: process_mrelease() and/or pidfd_open() not available\n");
+    int res = kill(pid, sig);
+    if (res != 0) {
+        return res;
+    }
+    // Can't do process_mrelease without a pidfd.
+    if (pidfd < 0) {
+        return 0;
+    }
+#if defined(HAVE_MRELEASE)
+    res = (int)syscall(__NR_process_mrelease, pidfd, 0);
+    if (res != 0) {
+        warn("%s: pid=%d: process_mrelease pidfd=%d failed: %s\n", __func__, pid, pidfd, strerror(errno));
+    } else {
+        info("%s: pid=%d: process_mrelease pidfd=%d success\n", __func__, pid, pidfd);
+    }
+#endif
+    // Return 0 regardless of process_mrelease outcome
+    return 0;
 }
-#ifndef __NR_pidfd_open
-#warning "__NR_pidfd_open is undefined, cannot use process_mrelease"
-#endif
-#ifndef __NR_process_mrelease
-#warning "__NR_process_mrelease is undefined, cannot use process_mrelease"
-#endif
-#endif
 
 /*
  * Send the selected signal to "pid" and wait for the process to exit
@@ -170,13 +173,14 @@ void mrelease(__attribute__((unused)) const pid_t pid)
  */
 int kill_wait(const poll_loop_args_t* args, pid_t pid, int sig)
 {
+    const unsigned poll_ms = 100;
     int pidfd = -1;
 
     if (args->dryrun && sig != 0) {
         warn("dryrun, not actually sending any signal\n");
         return 0;
     }
-    const unsigned poll_ms = 100;
+
     if (args->kill_process_group) {
         int res = getpgid(pid);
         if (res < 0) {
@@ -186,46 +190,30 @@ int kill_wait(const poll_loop_args_t* args, pid_t pid, int sig)
         warn("killing whole process group %d (-g flag is active)\n", res);
     }
 
-#if defined(__NR_pidfd_open) && defined(__NR_process_mrelease)
+#if defined(HAVE_MRELEASE)
     // Open the pidfd *before* calling kill().
-    // Otherwise process_mrelease() fails in 50% of cases with ESRCH.
     if (!args->kill_process_group && sig != 0) {
         pidfd = (int)syscall(__NR_pidfd_open, pid, 0);
         if (pidfd < 0) {
             warn("%s pid %d: error opening pidfd: %s\n", __func__, pid, strerror(errno));
         }
     }
+#else
+    warn("%s pid %d: system does not support process_mrelease, skipping\n", __func__, pid);
 #endif
 
-    int res = kill(pid, sig);
+    int res = kill_release(pid, pidfd, sig);
     if (res != 0) {
-        if (pidfd >= 0) {
-            close(pidfd);
-        }
-        return res;
+        goto out_close;
     }
+
     /* signal 0 does not kill the process. Don't wait for it to exit */
     if (sig == 0) {
-        return 0;
+        goto out_close;
     }
 
     struct timespec t0 = { 0 };
     clock_gettime(CLOCK_MONOTONIC, &t0);
-
-#if defined(__NR_pidfd_open) && defined(__NR_process_mrelease)
-    // Call the process_mrelease() syscall to release all the memory of
-    // the killed process as quickly as possible - see https://lwn.net/Articles/864184/
-    // for details.
-    if (pidfd >= 0) {
-        int res = (int)syscall(__NR_process_mrelease, pidfd, 0);
-        if (res != 0) {
-            warn("%s pid=%d: process_mrelease pidfd=%d failed: %s\n", __func__, pid, pidfd, strerror(errno));
-        } else {
-            debug("%s pid=%d: process_mrelease pidfd=%d success\n", __func__, pid, pidfd);
-        }
-        close(pidfd);
-    }
-#endif
 
     for (unsigned i = 0; i < 100; i++) {
         struct timespec t1 = { 0 };
@@ -239,11 +227,10 @@ int kill_wait(const poll_loop_args_t* args, pid_t pid, int sig)
             print_mem_stats(debug, m);
             if (m.MemAvailablePercent <= args->mem_kill_percent && m.SwapFreePercent <= args->swap_kill_percent) {
                 sig = SIGKILL;
-                res = kill(pid, sig);
-                // kill first, print after
-                warn("escalating to SIGKILL after %.1f seconds\n", secs);
+                warn("escalating to SIGKILL after %.3f seconds\n", secs);
+                res = kill_release(pid, pidfd, sig);
                 if (res != 0) {
-                    return res;
+                    goto out_close;
                 }
             }
         } else if (enable_debug) {
@@ -252,13 +239,25 @@ int kill_wait(const poll_loop_args_t* args, pid_t pid, int sig)
         }
         if (!is_alive(pid)) {
             warn("process %d exited after %.3f seconds\n", pid, secs);
-            return 0;
+            goto out_close;
         }
         struct timespec req = { .tv_sec = (time_t)(poll_ms / 1000), .tv_nsec = (poll_ms % 1000) * 1000000 };
         nanosleep(&req, NULL);
     }
+
+    res = -1;
     errno = ETIME;
-    return -1;
+    warn("process %d did not exit\n", pid);
+
+out_close:
+    if (pidfd >= 0) {
+        int saved_errno = errno;
+        if (close(pidfd)) {
+            warn("%s pid %d: error closing pidfd %d: %s\n", __func__, pid, pidfd, strerror(errno));
+        }
+        errno = saved_errno;
+    }
+    return res;
 }
 
 // is_larger finds out if the process with pid `cur->pid` uses more memory
@@ -267,60 +266,71 @@ int kill_wait(const poll_loop_args_t* args, pid_t pid, int sig)
 // it only fills the fields it needs to make a decision.
 bool is_larger(const poll_loop_args_t* args, const procinfo_t* victim, procinfo_t* cur)
 {
-    if (cur->pid <= 1) {
-        // Let's not kill init.
+    if (cur->pid <= 2) {
+        // Let's not kill init or kthreadd.
         return false;
     }
 
-    {
+    // Ignore processes owned by root user?
+    if (args->ignore_root_user) {
         int res = get_uid(cur->pid);
         if (res < 0) {
-            debug("pid %d: error reading uid: %s\n", cur->pid, strerror(-res));
+            debug("%s: pid %d: error reading uid: %s\n", __func__, cur->pid, strerror(-res));
             return false;
         }
         cur->uid = res;
+
+        if (cur->uid == 0) {
+            return false;
+        }
     }
-    if (cur->uid == 0 && args->ignore_root_user) {
-        // Ignore processes owned by root user.
+
+    {
+        bool res = parse_proc_pid_stat(&cur->stat, cur->pid);
+        if (!res) {
+            debug("%s: pid %d: error reading stat\n", __func__, cur->pid);
+            return false;
+        }
+        const long page_size = sysconf(_SC_PAGESIZE);
+        cur->VmRSSkiB = cur->stat.rss * page_size / 1024;
+    }
+
+    // A pid is a kernel thread if it's pid or ppid is 2.
+    // At least that's what procs does:
+    // https://github.com/warmchang/procps/blob/d173f5d6db746e3f252a6182aa1906a292fc200f/library/readproc.c#L1325
+    //
+    // The check for pid == 2 has already been done at the top.
+    if (cur->stat.ppid == 2) {
         return false;
     }
 
     {
         int res = get_oom_score(cur->pid);
         if (res < 0) {
-            debug("pid %d: error reading oom_score: %s\n", cur->pid, strerror(-res));
+            debug("%s: pid %d: error reading oom_score: %s\n", __func__, cur->pid, strerror(-res));
             return false;
         }
-        cur->badness = res;
-    }
-
-    {
-        long long res = get_vm_rss_kib(cur->pid);
-        if (res < 0) {
-            debug("pid %d: error reading rss: %s\n", cur->pid, strerror((int)-res));
-            return false;
-        }
-        cur->VmRSSkiB = res;
+        cur->oom_score = res;
     }
 
     if ((args->prefer_regex || args->avoid_regex || args->ignore_regex)) {
         int res = get_comm(cur->pid, cur->name, sizeof(cur->name));
         if (res < 0) {
-            debug("pid %d: error reading process name: %s\n", cur->pid, strerror(-res));
+            debug("%s: pid %d: error reading process name: %s\n", __func__, cur->pid, strerror(-res));
             return false;
         }
         if (args->prefer_regex && regexec(args->prefer_regex, cur->name, (size_t)0, NULL, 0) == 0) {
             if (args->sort_by_rss) {
                 cur->VmRSSkiB += VMRSS_PREFER;
             } else {
-                cur->badness += BADNESS_PREFER;
+                cur->oom_score += OOM_SCORE_PREFER;
             }
         }
         if (args->avoid_regex && regexec(args->avoid_regex, cur->name, (size_t)0, NULL, 0) == 0) {
             if (args->sort_by_rss) {
                 cur->VmRSSkiB += VMRSS_AVOID;
             } else {
-                cur->badness += BADNESS_AVOID;
+                cur->oom_score += OOM_SCORE_AVOID;
             }
         }
         if (args->ignore_regex && regexec(args->ignore_regex, cur->name, (size_t)0, NULL, 0) == 0) {
@@ -328,27 +338,40 @@ bool is_larger(const poll_loop_args_t* args, const procinfo_t* victim, procinfo_
         }
     }
 
-    if (cur->VmRSSkiB == 0) {
-        // Kernel threads have zero rss
-        return false;
-    }
-
+    // find process with the largest rss
     if (args->sort_by_rss) {
-         /* find process with the largest rss */
-        if (cur->VmRSSkiB < victim->VmRSSkiB) {
-            return false;
+        // Case 1: neither victim nor cur have rss=0 (zombie main thread).
+        // This is the usual case.
+        if (cur->VmRSSkiB > 0 && victim->VmRSSkiB > 0) {
+            if (cur->VmRSSkiB < victim->VmRSSkiB) {
+                return false;
+            }
+            if (cur->VmRSSkiB == victim->VmRSSkiB && cur->oom_score <= victim->oom_score) {
+                return false;
+            }
         }
-
-        if (cur->VmRSSkiB == victim->VmRSSkiB && cur->badness <= victim->badness) {
-            return false;
+        // Case 2: one (or both) have rss=0 (zombie main thread)
+        else {
+            if (cur->VmRSSkiB == 0) {
+                // only print the warning when the zombie is first seen, i.e. as "cur"
+                get_comm(cur->pid, cur->name, sizeof(cur->name));
+                warn("%s: pid %d \"%s\": rss=0 but oom_score=%d. Zombie main thread? Using oom_score for this process.\n",
+                    __func__, cur->pid, cur->name, cur->oom_score);
+            }
+            if (cur->oom_score < victim->oom_score) {
+                return false;
+            }
+            if (cur->oom_score == victim->oom_score && cur->VmRSSkiB <= victim->VmRSSkiB) {
+                return false;
+            }
         }
     } else {
         /* find process with the largest oom_score */
-        if (cur->badness < victim->badness) {
+        if (cur->oom_score < victim->oom_score) {
             return false;
         }
 
-        if (cur->badness == victim->badness && cur->VmRSSkiB <= victim->VmRSSkiB) {
+        if (cur->oom_score == victim->oom_score && cur->VmRSSkiB <= victim->VmRSSkiB) {
             return false;
         }
     }
@@ -358,42 +381,56 @@ bool is_larger(const poll_loop_args_t* args, const procinfo_t* victim, procinfo_
     {
         int res = get_oom_score_adj(cur->pid, &cur->oom_score_adj);
         if (res < 0) {
-            debug("pid %d: error reading oom_score_adj: %s\n", cur->pid, strerror(-res));
+            debug("%s: pid %d: error reading oom_score_adj: %s\n", __func__, cur->pid, strerror(-res));
             return false;
         }
         if (cur->oom_score_adj == -1000) {
             return false;
         }
     }
-
-    // Looks like we have a new victim. Fill out remaining fields
-    if (strlen(cur->name) == 0) {
-        int res = get_comm(cur->pid, cur->name, sizeof(cur->name));
-        if (res < 0) {
-            debug("pid %d: error reading process name: %s\n", cur->pid, strerror(-res));
-            return false;
-        }
-    }
-    /* read cmdline */
-    {
-        int res = get_cmdline(cur->pid, cur->cmdline, sizeof(cur->cmdline));
-        if (res < 0) {
-            debug("pid %d: error reading process cmdline: %s\n", cur->pid, strerror(-res));
-            return false;
-        }
-    }
-
     return true;
 }
 
+// Fill the fields in `cur` that are not required for the kill decision.
+// Used to log details about the selected process.
+void fill_informative_fields(procinfo_t* cur)
+{
+    if (strlen(cur->name) == 0) {
+        int res = get_comm(cur->pid, cur->name, sizeof(cur->name));
+        if (res < 0) {
+            debug("%s: pid %d: error reading process name: %s\n", __func__, cur->pid, strerror(-res));
+        }
+    }
+    if (strlen(cur->cmdline) == 0) {
+        int res = get_cmdline(cur->pid, cur->cmdline, sizeof(cur->cmdline));
+        if (res < 0) {
+            debug("%s: pid %d: error reading process cmdline: %s\n", __func__, cur->pid, strerror(-res));
+        }
+    }
+    if (cur->uid == PROCINFO_FIELD_NOT_SET) {
+        int res = get_uid(cur->pid);
+        if (res < 0) {
+            debug("%s: pid %d: error reading uid: %s\n", __func__, cur->pid, strerror(-res));
+        } else {
+            cur->uid = res;
+        }
+    }
+}
+
 // debug_print_procinfo pretty-prints the process information in `cur`.
-void debug_print_procinfo(const procinfo_t* cur)
+void debug_print_procinfo(procinfo_t* cur)
 {
     if (!enable_debug) {
         return;
     }
-    debug("pid %5d: badness %3d VmRSS %7lld uid %4d oom_score_adj %4d \"%s\"",
-        cur->pid, cur->badness, cur->VmRSSkiB, cur->uid, cur->oom_score_adj, cur->name);
+    fill_informative_fields(cur);
+    debug("%5d %9d %7lld %5d %13d \"%s\"",
+        cur->pid, cur->oom_score, cur->VmRSSkiB, cur->uid, cur->oom_score_adj, cur->name);
+}
+
+void debug_print_procinfo_header()
+{
+    debug("  PID OOM_SCORE  RSSkiB   UID OOM_SCORE_ADJ  COMM\n");
 }
 
 /*
@@ -411,7 +448,18 @@ procinfo_t find_largest_process(const poll_loop_args_t* args)
         clock_gettime(CLOCK_MONOTONIC, &t0);
     }
 
-    procinfo_t victim = { 0 };
+    debug_print_procinfo_header();
+
+    const procinfo_t empty_procinfo = {
+        .pid = PROCINFO_FIELD_NOT_SET,
+        .uid = PROCINFO_FIELD_NOT_SET,
+        .oom_score = PROCINFO_FIELD_NOT_SET,
+        .oom_score_adj = PROCINFO_FIELD_NOT_SET,
+        .VmRSSkiB = PROCINFO_FIELD_NOT_SET,
+        /* omitted fields are set to zero */
+    };
+
+    procinfo_t victim = empty_procinfo;
     while (1) {
         errno = 0;
         struct dirent* d = readdir(procdir);
@@ -426,14 +474,8 @@ procinfo_t find_largest_process(const poll_loop_args_t* args)
         if (!isnumeric(d->d_name))
             continue;
 
-        procinfo_t cur = {
-            .pid = (int)strtol(d->d_name, NULL, 10),
-            .uid = -1,
-            .badness = -1,
-            .VmRSSkiB = -1,
-            .oom_score_adj = -1,
-            /* omitted fields are set to zero */
-        };
+        procinfo_t cur = empty_procinfo;
+        cur.pid = (int)strtol(d->d_name, NULL, 10);
 
         bool larger = is_larger(args, &victim, &cur);
 
@@ -459,6 +501,11 @@ procinfo_t find_largest_process(const poll_loop_args_t* args)
             __func__, victim.pid);
         // zero victim struct
         victim = (const procinfo_t) { 0 };
+    }
+
+    if (victim.pid >= 0) {
+        // We will pretty-print the victim later, so get all the info.
+        fill_informative_fields(&victim);
     }
 
     return victim;
@@ -489,9 +536,9 @@ void kill_process(const poll_loop_args_t* args, int sig, const procinfo_t* victi
     }
     // sig == 0 is used as a self-test during startup. Don't notify the user.
     if (sig != 0 || enable_debug) {
-        warn("sending %s to process %d uid %d \"%s\": badness %d, VmRSS %lld MiB\n",
-            sig_name, victim->pid, victim->uid, victim->name, victim->badness, victim->VmRSSkiB / 1024);
-        warn("process %d cmdline \"%s\"\n", victim->pid, victim->cmdline);
+        warn("sending %s to process %d uid %d \"%s\": oom_score %d, VmRSS %lld MiB, cmdline \"%s\"\n",
+            sig_name, victim->pid, victim->uid, victim->name, victim->oom_score, victim->VmRSSkiB / 1024,
+            victim->cmdline);
     }
 
     int res = kill_wait(args, victim->pid, sig);

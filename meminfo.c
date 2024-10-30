@@ -15,6 +15,7 @@
 #include "globals.h"
 #include "meminfo.h"
 #include "msg.h"
+#include "proc_pid.h"
 
 /* Parse the contents of /proc/meminfo (in buf), return value of "name"
  * (example: "MemTotal:")
@@ -134,42 +135,14 @@ bool is_alive(int pid)
         return false;
     }
 
-    char buf[PATH_LEN] = { 0 };
-    // Read /proc/[pid]/stat
-    snprintf(buf, sizeof(buf), "%s/%d/stat", procdir_path, pid);
-    FILE* f = fopen(buf, "r");
-    if (f == NULL) {
-        // Process is gone - good.
+    pid_stat_t stat;
+    if (!parse_proc_pid_stat(&stat, pid)) {
         return false;
     }
 
-    // File content looks like this:
-    // 10751 (cat) R 2663 10751 2663[...]
-    // File may be bigger than 256 bytes, but we only need the first 20 or so.
-    memset(buf, 0, sizeof(buf));
-    size_t len = fread(buf, 1, sizeof(buf), f);
-    bool read_error = ferror(f) || len == 0;
-    fclose(f);
-    if (read_error) {
-        warn("%s: fread failed: %s\n", __func__, strerror(errno));
-        return false;
-    }
-
-    // Find last ")" by searching from the end
-    int i = sizeof(buf) - 1;
-    for (; i >= 0; i--) {
-        if (buf[i] == ')')
-            break;
-    }
-    if (i <= 0 || i + 2 >= (int)sizeof(buf)) {
-        warn("%s: could not find closing bracket\n", __func__);
-        return false;
-    }
-    char state = buf[i + 2];
-
-    debug("process state: %c\n", state);
-    if (state == 'Z') {
-        // A zombie process does not use any memory. Consider it dead.
+    debug("%s: state=%c num_threads=%ld\n", __func__, stat.state, stat.num_threads);
+    if (stat.state == 'Z' && stat.num_threads == 1) {
+        // A zombie process without subthreads does not use any memory. Consider it dead.
         return false;
     }
     return true;
@@ -250,8 +223,8 @@ int get_comm(int pid, char* out, size_t outlen)
     return 0;
 }
 
-
 /* Read /proc/[pid]/cmdline (process command line truncated to 256 bytes).
+ * The null bytes are replaced by space.
  * Returns 0 on success and -errno on error.
  */
 int get_cmdline(int pid, char* out, size_t outlen)
@@ -270,9 +243,6 @@ int get_cmdline(int pid, char* out, size_t outlen)
         return -fread_errno;
     }
     fclose(f);
-    if (n < 1) {
-        return -ENODATA;
-    }
     /* replace null character with space */
     for (size_t i = 0; i < n; i++) {
         if (out[i] == '\0') {
@@ -290,46 +260,13 @@ int get_cmdline(int pid, char* out, size_t outlen)
 int get_uid(int pid)
 {
     char path[PATH_LEN] = { 0 };
-    snprintf(path, sizeof(path), "/proc/%d", pid);
+    snprintf(path, sizeof(path), "%s/%d", procdir_path, pid);
     struct stat st = { 0 };
     int res = stat(path, &st);
     if (res < 0) {
         return -errno;
     }
     return (int)st.st_uid;
-}
-
-// Read VmRSS from /proc/[pid]/statm and convert to kiB.
-// Returns the value (>= 0) or -errno on error.
-long long get_vm_rss_kib(int pid)
-{
-    long long vm_rss_kib = -1;
-    char path[PATH_LEN] = { 0 };
-
-    // Read VmRSS from /proc/[pid]/statm (in pages)
-    snprintf(path, sizeof(path), "%s/%d/statm", procdir_path, pid);
-    FILE* f = fopen(path, "r");
-    if (f == NULL) {
-        return -errno;
-    }
-    int matches = fscanf(f, "%*u %lld", &vm_rss_kib);
-    fclose(f);
-    if (matches < 1) {
-        return -ENODATA;
-    }
-
-    // Read and cache page size
-    static long page_size;
-    if (page_size == 0) {
-        page_size = sysconf(_SC_PAGESIZE);
-        if (page_size <= 0) {
-            fatal(1, "could not read page size\n");
-        }
-    }
-
-    // Convert to kiB
-    vm_rss_kib = vm_rss_kib * page_size / 1024;
-    return vm_rss_kib;
 }
 
 /* Print a status line like

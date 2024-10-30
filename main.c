@@ -80,6 +80,27 @@ static void startup_selftests(poll_loop_args_t* args)
             warn("%s: -N: notify script '%s' is not executable: %s\n", __func__, args->notify_ext, strerror(errno));
         }
     }
+
+#ifdef PROFILE_FIND_LARGEST_PROCESS
+    struct timespec t0 = { 0 }, t1 = { 0 };
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    warn("PROFILE_FIND_LARGEST_PROCESS: looping forever on find_largest_process(). Use sysprof of perf to capture profile.\n");
+    long i = 0;
+    while (1) {
+        find_largest_process(args);
+        i++;
+
+        const int avg_n = 1000;
+        if (i % avg_n == 0) {
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            long delta_usecs = (t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_nsec - t0.tv_nsec) / 1000;
+            double avg_wall_time_ms = (double)(delta_usecs / avg_n) / 1000.0;
+            info("average find_largest_process() wall time: %.3lf ms\n", avg_wall_time_ms);
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+        }
+    };
+#endif
 }
 
 int main(int argc, char* argv[])
@@ -138,6 +159,7 @@ int main(int argc, char* argv[])
         { "syslog", no_argument, NULL, LONG_OPT_USE_SYSLOG },
         { "syslog-stderr", no_argument, NULL, LONG_OPT_USE_SYSLOG_STDERR },
         { "help", no_argument, NULL, 'h' },
+        { "debug", no_argument, NULL, 'd' },
         { 0, 0, NULL, 0 } /* end-of-array marker */
     };
     bool have_m = 0, have_M = 0, have_s = 0, have_S = 0;
@@ -269,7 +291,7 @@ int main(int argc, char* argv[])
                 "  -n                        enable d-bus notifications\n"
                 "  -N /PATH/TO/SCRIPT        call script after oom kill\n"
                 "  -g                        kill all processes within a process group\n"
-                "  -d                        enable debugging messages\n"
+                "  -d, --debug               enable debugging messages\n"
                 "  -v                        print version information and exit\n"
                 "  -r INTERVAL               memory report interval in seconds (default 1), set\n"
                 "                            to 0 to disable completely\n"
@@ -363,9 +385,9 @@ int main(int argc, char* argv[])
     // Print memory limits
     fprintf(stderr, "mem total: %4lld MiB, user mem total: %4lld MiB, swap total: %4lld MiB\n",
         m.MemTotalKiB / 1024, m.UserMemTotalKiB / 1024, m.SwapTotalKiB / 1024);
-    fprintf(stderr, "sending SIGTERM when mem <= " PRIPCT " and swap <= " PRIPCT ",\n",
+    fprintf(stderr, "sending SIGTERM when mem avail <= " PRIPCT " and swap free <= " PRIPCT ",\n",
         args.mem_term_percent, args.swap_term_percent);
-    fprintf(stderr, "        SIGKILL when mem <= " PRIPCT " and swap <= " PRIPCT "\n",
+    fprintf(stderr, "        SIGKILL when mem avail <= " PRIPCT " and swap free <= " PRIPCT "\n",
         args.mem_kill_percent, args.swap_kill_percent);
 
     startup_selftests(&args);

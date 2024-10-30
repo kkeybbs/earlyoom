@@ -10,7 +10,24 @@ import (
 // #include "kill.h"
 // #include "msg.h"
 // #include "globals.h"
+// #include "proc_pid.h"
 import "C"
+
+func init() {
+	C.enable_debug = 1
+}
+
+func enable_debug(state bool) (oldState bool) {
+	if C.enable_debug == 1 {
+		oldState = true
+	}
+	if state {
+		C.enable_debug = 1
+	} else {
+		C.enable_debug = 0
+	}
+	return
+}
 
 func parse_term_kill_tuple(optarg string, upper_limit int) (error, float64, float64) {
 	cs := C.CString(optarg)
@@ -37,6 +54,23 @@ func parse_meminfo() C.meminfo_t {
 	return C.parse_meminfo()
 }
 
+// Wrapper so _test.go code can create a poll_loop_args_t
+// struct. _test.go code cannot use C.
+func poll_loop_args_t(sort_by_rss bool) (args C.poll_loop_args_t) {
+	args.sort_by_rss = C.bool(sort_by_rss)
+	return
+}
+
+func procinfo_t() C.procinfo_t {
+	return C.procinfo_t{}
+}
+
+func is_larger(args *C.poll_loop_args_t, victim mockProcProcess, cur mockProcProcess) bool {
+	cVictim := victim.toProcinfo_t()
+	cCur := cur.toProcinfo_t()
+	return bool(C.is_larger(args, &cVictim, &cCur))
+}
+
 func find_largest_process() {
 	var args C.poll_loop_args_t
 	C.find_largest_process(&args)
@@ -60,10 +94,6 @@ func get_oom_score_adj(pid int, out *int) int {
 	return int(res)
 }
 
-func get_vm_rss_kib(pid int) int {
-	return int(C.get_vm_rss_kib(C.int(pid)))
-}
-
 func get_comm(pid int) (int, string) {
 	cstr := C.CString(strings.Repeat("\000", 256))
 	res := C.get_comm(C.int(pid), cstr, 256)
@@ -76,7 +106,21 @@ func get_cmdline(pid int) (int, string) {
 	return int(res), C.GoString(cstr)
 }
 
-func procdir_path(str string) {
-	cstr := C.CString(str)
-	C.procdir_path = cstr
+func procdir_path(str string) string {
+	if str != "" {
+		cstr := C.CString(str)
+		C.procdir_path = cstr
+	}
+	return C.GoString(C.procdir_path)
+}
+
+func parse_proc_pid_stat_buf(buf string) (res bool, out C.pid_stat_t) {
+	cbuf := C.CString(buf)
+	res = bool(C.parse_proc_pid_stat_buf(&out, cbuf))
+	return res, out
+}
+
+func parse_proc_pid_stat(pid int) (res bool, out C.pid_stat_t) {
+	res = bool(C.parse_proc_pid_stat(&out, C.int(pid)))
+	return res, out
 }

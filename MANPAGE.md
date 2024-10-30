@@ -17,8 +17,10 @@ after running out of patience.
 
 **earlyoom** checks the amount of available memory and free swap up to 10 times a
 second (less often if there is a lot of free memory).
-If **both** memory **and** swap are below 10%, it will kill the largest process (highest `oom_score`).
-The percentage value is configurable via command line arguments.
+If **both** memory **and** swap (if any) are below 10%, it will kill the
+largest process (highest `oom_score`).
+
+The percentage values are configurable via command line arguments.
 
 If there is a failure when trying to kill a process, **earlyoom** sleeps for
 1 second to limit log spam due to recurring errors.
@@ -26,10 +28,20 @@ If there is a failure when trying to kill a process, **earlyoom** sleeps for
 # OPTIONS
 
 #### -m PERCENT[,KILL_PERCENT]
-set available memory minimum to PERCENT of total (default 10 %).
+set available memory minimum to PERCENT of `user mem total` (default 10 %).
 
-earlyoom starts sending SIGTERM once **both** memory **and** swap are below their
-respective PERCENT setting. It sends SIGKILL once **both** are below their respective
+`user mem total`, introduced in earlyoom v1.8, is the memory accessible by userspace
+(`MemAvailable`+`AnonPages` as reported in `/proc/meminfo`).
+When a tmpfs ramdisk fills up, `user mem total` shrinks accordingly.
+
+By using a percentage of `user mem total` as opposed to total memory,
+the set memory minimum can always be achieved by killing processes, even
+when tmpfs fills a large portion of memory.
+
+earlyoom sends SIGTERM once **both** available memory **and** free swap are
+below their respective PERCENT settings.
+
+It sends SIGKILL once **both** are below their respective
 KILL_PERCENT setting (default PERCENT/2).
 
 Use the same value for PERCENT and KILL_PERCENT if you always want to use SIGKILL.
@@ -53,7 +65,11 @@ Use the same value for PERCENT and KILL_PERCENT if you always want to use SIGKIL
 #### -M SIZE[,KILL_SIZE]
 As an alternative to specifying a percentage of total memory, `-M` sets
 the available memory minimum to SIZE KiB. The value is internally converted
-to a percentage. If you pass both `-M` and `-m`, the lower value is used.
+to the percentage of `mem total` as reported on startup. `user mem total` is
+NOT used for the startup calculation because that would make the outcome dependent
+on how filled tmpfs is at that moment.
+
+If you pass both `-M` and `-m`, the lower value is used.
 Example: Reserve 10% of RAM but at most 1 GiB:
 
     earlyoom -m 10 -M 1048576
@@ -73,7 +89,7 @@ removed in earlyoom v1.2, ignored for compatibility
 #### -i
 removed in earlyoom v1.7, ignored for compatibility
 
-#### -d
+#### -d, --debug
 enable debugging messages
 
 #### -v
@@ -145,13 +161,23 @@ Be sure to check how your environment behaves beforehand. Use
 to show all processes with the PGID in brackets.
 
 #### \-\-prefer REGEX
-prefer killing processes matching REGEX (adds 300 to oom_score)
+Prefer killing processes whose `comm` name matches REGEX (adds 300 to oom_score).
+
+The `comm` name is the string in `/proc/pid/comm`. It is the first 15 bytes of the
+process name. Longer names are truncated to 15 bytes.
+
+The `comm` name is also what `top`, `pstree`, `ps -e` show. Use any of these tools
+to find the proper `comm` name.
+
+Example: You want to match `gnome-control-center`, which is longer than 15 bytes:
+
+    earlyoom --prefer '^gnome-control-c$'
 
 #### \-\-avoid REGEX
-avoid killing processes matching REGEX (subtracts 300 from oom_score)
+avoid killing processes whose `comm` name matches REGEX (subtracts 300 from oom_score).
 
 #### \-\-ignore REGEX
-ignore processes matching REGEX.
+ignore processes whose `comm` name matches REGEX.
 
 Unlike the \-\-avoid option, this option disables any potential killing of the matched processes
 that might have occurred due to the processes attaining a high oom_score.
@@ -166,7 +192,15 @@ find process with the largest rss (default oom_score)
 dry run (do not kill any processes)
 
 #### \-\-syslog
-use syslog instead of std streams
+use syslog instead of std streams.
+
+Usually this is not needed as systemd handles logging
+of all output.
+
+The \-\-syslog option may be useful for minimal embedded
+systems that don't run systemd.
+See https://github.com/rfjakob/earlyoom/pull/292 for some
+background info.
 
 #### -h, \-\-help
 this help text
@@ -234,3 +268,7 @@ The author of earlyoom is Jakob Unterwurzacher ⟨jakobunt@gmail.com⟩.
 
 This manual page was written by Yangfl ⟨mmyangfl@gmail.com⟩, for the Debian
 project (and may be used by others).
+
+# SEE ALSO
+
+nohang(8)
