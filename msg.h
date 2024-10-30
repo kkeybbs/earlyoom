@@ -31,4 +31,7 @@ void fix_truncated_utf8(char* str);
 
 void earlyoom_syslog_init();
 
+// set flag to write warn and fatal logs to stderr, info and debug logs to color_log(tty)
+void earlyoom_syslog_stderr();
+
 #endif
